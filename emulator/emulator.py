@@ -63,6 +63,7 @@ class EmulatorSocket:
         self.topology = topology
         self.root_node = self.topology.get_root_node(self.listen_address)
         self.forwarding_table = ForwardingTable(self.topology, self.listen_address)
+        self.seq_num = 0
 
     def send_hellos(self):
         for node in self.topology.get_neighbors(self.root_node):
@@ -79,6 +80,25 @@ class EmulatorSocket:
         inner_packet = self.build_inner_packet('H', 0, None)
         return self.build_full_packet(src_ip, src_port, dest_ip, dest_port, 100, inner_packet)
 
+    def send_linkstates(self):
+        neighbors = self.topology.get_neighbors(self.root_node)
+        data = ' '.join(str(neighbor) + ',1' for neighbor in neighbors)
+
+        for node in neighbors:
+            packet = self.build_lsp(self.root_node, node, data)
+            packet.next_hop_address = node.full_address
+            self.send_packet(packet)
+
+    def build_lsp(self, src_node, dest_node, data):
+        self.seq_num += 1
+        src_ip = self.convert_ip_to_int(src_node.ip_address)
+        src_port = src_node.port
+        dest_ip = self.convert_ip_to_int(dest_node.ip_address)
+        dest_port = dest_node.port
+
+        inner_packet = self.build_inner_packet('L', self.seq_num, data)
+        return self.build_full_packet(src_ip, src_port, dest_ip, dest_port, 100, inner_packet)
+
     def build_inner_packet(self, pack_type, seq_num, data):
         inner_packet = struct.pack("!cII", pack_type.encode('ascii'), seq_num, 0 if data is None else len(data))
         if data is not None:
@@ -93,11 +113,17 @@ class EmulatorSocket:
 
     def check_neighbor_health(self):
         for node in self.topology.get_neighbors(self.root_node):
-            needs_removal = not self.forwarding_table.is_healthy(node)
+            self.forwarding_table.validate_node_health(node)
 
     def refresh_neighbor_health(self, packet):
         node = Node(packet.src_ip, packet.src_port)
-        self.forwarding_table.refresh_node_heatlh(node)
+        if self.topology.contains_node(node) and node in self.topology.get_neighbors(self.root_node):
+            self.forwarding_table.refresh_node_heatlh(node)
+        else:
+            self.forwarding_table.add_node(node)
+
+    def handle_lsp(self, packet):
+        self.forwarding_table.update_lsp(packet)
 
     def convert_ip_to_int(self, ip_string):
         return struct.unpack("!L", socket.inet_aton(ip_string))[0]
@@ -106,9 +132,11 @@ class EmulatorSocket:
         self.socket.sendto(packet.packet, packet.next_hop_address)
 
     def await_packet(self):
-        full_packet, from_address = self.socket.recvfrom(5500)
-
-        return Packet(full_packet, from_address)
+        try:
+            full_packet, from_address = self.socket.recvfrom(5500)
+            return Packet(full_packet, from_address)
+        except Exception as e:
+            pass
 
 
 class Node:
@@ -135,11 +163,17 @@ class NetworkTopology:
     def __init__(self):
         self.node_table = {}
 
-    def add_node_details(self, node_details):
+    def add_node_details(self, node_details, update_packet = None):
         root_node = node_details[0]
         node_neighbors = node_details[1:]
 
-        self.node_table[root_node] = node_neighbors
+        self.node_table[root_node] = (node_neighbors, update_packet)
+
+    def contains_node(self, node):
+        if node in self.node_table:
+            return True
+
+        return False
 
     def get_root_node(self, address):
         for node in self.node_table.keys():
@@ -150,13 +184,52 @@ class NetworkTopology:
         return self.node_table.keys()
 
     def get_neighbors(self, node):
-        return self.node_table[node]
+        return self.node_table[node][0]
+
+    def add_neighbor(self, node, neighbor_node, update_packet=None):
+        if neighbor_node not in self.node_table:
+            self.node_table[neighbor_node] = ([node], update_packet)
+
+        if node not in self.node_table[neighbor_node][0]:
+            self.node_table[neighbor_node][0].append(node)
+
+        if neighbor_node not in self.node_table[node][0]:
+            self.node_table[node][0].append(neighbor_node)
+
+    def remove_node(self, node, neighbor_node):
+        self.node_table[node][0].remove(neighbor_node)
+        self.node_table[neighbor_node][0].remove(node)
+        if not self.node_reachable(node):
+            del self.node_table[neighbor_node]
+
+    def update_node(self, packet, node, neighbors):
+        if node not in self.node_table:
+            self.node_table[node] = (neighbors, packet)
+            return True
+
+        if self.node_table[node][1] is None or self.node_table[node][1].seq_num < packet.seq_num:
+            if set(self.node_table[node][0]) != set(self.node_table[node][0]):
+                self.node_table[node] = (neighbors, packet)
+                return True
+            else:
+                self.node_table[node] = (self.node_table[node][0], packet)
+                return False
+
+        return False
+
+
+    def node_reachable(self, node):
+        for key in self.node_table.keys():
+            if node in self.node_table[key][0]:
+                return True
+
+        return False
 
     def print_network_topology(self):
         print("====== Current Topology ======")
         for key in self.node_table.keys():
             row_text = str(key)
-            for neighbor in self.node_table[key]:
+            for neighbor in self.node_table[key][0]:
                 row_text += " " + str(neighbor)
 
             print(row_text)
@@ -171,6 +244,7 @@ class ForwardingTable:
         self.build()
 
     def build(self):
+        self.forwarding_table = {}
         all_nodes = self.topology.get_all_nodes()
         visited_nodes = []
 
@@ -211,19 +285,37 @@ class ForwardingTable:
     def get_entry(self, node):
         return self.forwarding_table[node]
 
-    def is_healthy(self, node):
+    def validate_node_health(self, node):
         entry = self.forwarding_table[node]
         time_rem = int(time.time() * 1000) - entry[2]
 
         if time_rem >= 2000:
-            print("deleting entry")
-            return False
-
-        return True
+            self.topology.remove_node(self.topology.get_root_node(self.root_address), node)
+            self.build()
 
     def refresh_node_heatlh(self, node):
         entry = self.forwarding_table[node]
         entry[2] = int(time.time() * 1000)
+
+    def add_node(self, node):
+        self.topology.add_neighbor(self.topology.get_root_node(self.root_address), node)
+        self.build()
+
+    def update_lsp(self, packet):
+        from_node = Node(packet.src_ip, packet.src_port)
+        augmented_neighbors = packet.data.split(' ')
+        neighbors = []
+
+        for augmented_neighbor in augmented_neighbors:
+            ip, port, cost = augmented_neighbor.split(',')
+            port = int(port)
+            neighbors.append(Node(ip, port))
+
+        did_update = self.topology.update_node(packet, from_node, neighbors)
+
+        if did_update:
+            print("updated via lsp")
+            self.build()
 
     def print_forwarding_table(self):
         print("====== Current Forwarding Table ======")
@@ -287,11 +379,7 @@ def listen_for_packets(emulator_socket):
         last_update_time = createroutes(last_update_time, emulator_socket)
         try:
             incoming_packet = emulator_socket.await_packet()
-
-            if incoming_packet.type == 'H':
-                emulator_socket.refresh_neighbor_health(incoming_packet)
-
-            # forwardpacket(emulator_socket, incoming_packet)
+            forwardpacket(emulator_socket, incoming_packet)
 
         except BlockingIOError as e:
             pass
@@ -303,13 +391,21 @@ def createroutes(last_update_time, emulator_socket):
     emulator_socket.check_neighbor_health()
     if current_time - last_update_time >= 1000:
         emulator_socket.send_hellos()
+        emulator_socket.send_linkstates()
         return current_time
 
     return last_update_time
 
 
 def forwardpacket(emulator_socket, incoming_packet):
-    return
+    if incoming_packet is None:
+        return
+
+    if incoming_packet.type == 'H':
+        emulator_socket.refresh_neighbor_health(incoming_packet)
+
+    if incoming_packet.type == 'L':
+        emulator_socket.handle_lsp(incoming_packet)
 
 
 if __name__ == '__main__':
