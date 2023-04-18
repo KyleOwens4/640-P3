@@ -100,7 +100,7 @@ class EmulatorSocket:
         return self.build_full_packet(src_ip, src_port, dest_ip, dest_port, 100, inner_packet)
 
     def build_inner_packet(self, pack_type, seq_num, data):
-        inner_packet = struct.pack("!cII", pack_type.encode('ascii'), seq_num, 0 if data is None else len(data))
+        inner_packet = struct.pack("!cII", pack_type.encode('ascii'), socket.htonl(seq_num), 0 if data is None else len(data))
         if data is not None:
             inner_packet += data.encode()
 
@@ -123,7 +123,17 @@ class EmulatorSocket:
             self.forwarding_table.add_node(node)
 
     def handle_lsp(self, packet):
-        self.forwarding_table.update_lsp(packet)
+        is_new = self.forwarding_table.update_lsp(packet)
+
+        if is_new and packet.ttl > 0:
+            packet.ttl -= 1
+            neighbors = self.topology.get_neighbors(self.root_node)
+
+            for neighbor in neighbors:
+                if neighbor.full_address != packet.from_address:
+                    packet.next_hop_address = neighbor.full_address
+                    self.send_packet(packet)
+
 
     def convert_ip_to_int(self, ip_string):
         return struct.unpack("!L", socket.inet_aton(ip_string))[0]
@@ -162,6 +172,7 @@ class Node:
 class NetworkTopology:
     def __init__(self):
         self.node_table = {}
+        self.root_node = None
 
     def add_node_details(self, node_details, update_packet = None):
         root_node = node_details[0]
@@ -178,13 +189,14 @@ class NetworkTopology:
     def get_root_node(self, address):
         for node in self.node_table.keys():
             if node.full_address == address:
+                self.root_node = node
                 return node
 
     def get_all_nodes(self):
         return self.node_table.keys()
 
     def get_neighbors(self, node):
-        return self.node_table[node][0]
+        return [] if node not in self.node_table else self.node_table[node][0]
 
     def add_neighbor(self, node, neighbor_node, update_packet=None):
         if neighbor_node not in self.node_table:
@@ -205,20 +217,33 @@ class NetworkTopology:
     def update_node(self, packet, node, neighbors):
         if node not in self.node_table:
             self.node_table[node] = (neighbors, packet)
-            return True
+            return True, True
 
         if self.node_table[node][1] is None or self.node_table[node][1].seq_num < packet.seq_num:
-            if set(self.node_table[node][0]) != set(self.node_table[node][0]):
+
+            if set(self.node_table[node][0]) != set(neighbors):
+                packet.print_debug_info()
                 self.node_table[node] = (neighbors, packet)
-                return True
+                return True, True
             else:
                 self.node_table[node] = (self.node_table[node][0], packet)
-                return False
+                return False, True
 
-        return False
+        return False, False
 
+    def remove_unreachable(self):
+        remove = []
+        for node in self.node_table.keys():
+            if not self.node_reachable(node):
+                remove.append(node)
+
+        for node in remove:
+            del self.node_table[node]
 
     def node_reachable(self, node):
+        if node == self.root_node:
+            return True
+
         for key in self.node_table.keys():
             if node in self.node_table[key][0]:
                 return True
@@ -245,6 +270,7 @@ class ForwardingTable:
 
     def build(self):
         self.forwarding_table = {}
+        self.topology.remove_unreachable()
         all_nodes = self.topology.get_all_nodes()
         visited_nodes = []
 
@@ -255,7 +281,9 @@ class ForwardingTable:
         cost_queue = PriorityQueue()
         cost_queue.put((0, root_node))
 
-        while set(visited_nodes) != set(all_nodes) and not cost_queue.empty():
+        cur_cost = 0
+        self.topology.print_network_topology()
+        while set(visited_nodes) != set(all_nodes) and not cost_queue.empty() and cur_cost < len(all_nodes):
             cur_cost, cur_node = cost_queue.get()
             visited_nodes.append(cur_node)
 
@@ -299,6 +327,7 @@ class ForwardingTable:
 
     def add_node(self, node):
         self.topology.add_neighbor(self.topology.get_root_node(self.root_address), node)
+
         self.build()
 
     def update_lsp(self, packet):
@@ -311,11 +340,12 @@ class ForwardingTable:
             port = int(port)
             neighbors.append(Node(ip, port))
 
-        did_update = self.topology.update_node(packet, from_node, neighbors)
+        table_refresh, is_new = self.topology.update_node(packet, from_node, neighbors)
 
-        if did_update:
-            print("updated via lsp")
+        if table_refresh:
             self.build()
+
+        return is_new
 
     def print_forwarding_table(self):
         print("====== Current Forwarding Table ======")
@@ -382,6 +412,7 @@ def listen_for_packets(emulator_socket):
             forwardpacket(emulator_socket, incoming_packet)
 
         except BlockingIOError as e:
+            print(str(e))
             pass
 
 
