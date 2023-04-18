@@ -113,7 +113,9 @@ class EmulatorSocket:
 
     def check_neighbor_health(self):
         for node in self.topology.get_neighbors(self.root_node):
-            self.forwarding_table.validate_node_health(node)
+            if not self.forwarding_table.validate_node_health(node):
+                print('sending linkstate due to dead node')
+                self.send_linkstates()
 
     def refresh_neighbor_health(self, packet):
         node = Node(packet.src_ip, packet.src_port)
@@ -121,6 +123,8 @@ class EmulatorSocket:
             self.forwarding_table.refresh_node_heatlh(node)
         else:
             self.forwarding_table.add_node(node)
+            print('sending LSP due to new node')
+            self.send_linkstates()
 
     def handle_lsp(self, packet):
         is_new = self.forwarding_table.update_lsp(packet)
@@ -222,7 +226,6 @@ class NetworkTopology:
         if self.node_table[node][1] is None or self.node_table[node][1].seq_num < packet.seq_num:
 
             if set(self.node_table[node][0]) != set(neighbors):
-                packet.print_debug_info()
                 self.node_table[node] = (neighbors, packet)
                 return True, True
             else:
@@ -252,9 +255,9 @@ class NetworkTopology:
 
     def print_network_topology(self):
         print("====== Current Topology ======")
-        for key in self.node_table.keys():
+        for key in sorted(self.node_table.keys()):
             row_text = str(key)
-            for neighbor in self.node_table[key][0]:
+            for neighbor in sorted(self.node_table[key][0]):
                 row_text += " " + str(neighbor)
 
             print(row_text)
@@ -266,9 +269,9 @@ class ForwardingTable:
         self.forwarding_table = {}
         self.topology = topology
         self.root_address = root_address
-        self.build()
+        self.buildForwardTable()
 
-    def build(self):
+    def buildForwardTable(self):
         self.forwarding_table = {}
         self.topology.remove_unreachable()
         all_nodes = self.topology.get_all_nodes()
@@ -282,7 +285,6 @@ class ForwardingTable:
         cost_queue.put((0, root_node))
 
         cur_cost = 0
-        self.topology.print_network_topology()
         while set(visited_nodes) != set(all_nodes) and not cost_queue.empty() and cur_cost < len(all_nodes):
             cur_cost, cur_node = cost_queue.get()
             visited_nodes.append(cur_node)
@@ -317,9 +319,12 @@ class ForwardingTable:
         entry = self.forwarding_table[node]
         time_rem = int(time.time() * 1000) - entry[2]
 
-        if time_rem >= 2000:
+        if time_rem >= 700:
             self.topology.remove_node(self.topology.get_root_node(self.root_address), node)
-            self.build()
+            self.buildForwardTable()
+            return False
+
+        return True
 
     def refresh_node_heatlh(self, node):
         entry = self.forwarding_table[node]
@@ -327,8 +332,7 @@ class ForwardingTable:
 
     def add_node(self, node):
         self.topology.add_neighbor(self.topology.get_root_node(self.root_address), node)
-
-        self.build()
+        self.buildForwardTable()
 
     def update_lsp(self, packet):
         from_node = Node(packet.src_ip, packet.src_port)
@@ -343,13 +347,13 @@ class ForwardingTable:
         table_refresh, is_new = self.topology.update_node(packet, from_node, neighbors)
 
         if table_refresh:
-            self.build()
+            self.buildForwardTable()
 
         return is_new
 
     def print_forwarding_table(self):
         print("====== Current Forwarding Table ======")
-        for key in self.forwarding_table.keys():
+        for key in sorted(self.forwarding_table.keys()):
             row_text = str(key)
             row_text += " " + str(self.forwarding_table[key][0])
 
@@ -403,10 +407,11 @@ def readtopology(filename):
 
 
 def listen_for_packets(emulator_socket):
-    last_update_time = int(time.time() * 1000)
-
+    last_hello_time = int(time.time() * 1000)
+    last_lsp_time = int(time.time() * 1000)
+    emulator_socket.send_hellos()
     while True:
-        last_update_time = createroutes(last_update_time, emulator_socket)
+        last_hello_time, last_lsp_time = createroutes(last_hello_time, last_lsp_time, emulator_socket)
         try:
             incoming_packet = emulator_socket.await_packet()
             forwardpacket(emulator_socket, incoming_packet)
@@ -416,16 +421,19 @@ def listen_for_packets(emulator_socket):
             pass
 
 
-def createroutes(last_update_time, emulator_socket):
+def createroutes(last_hello_time, last_lsp_time, emulator_socket):
     current_time = int(time.time() * 1000)
 
     emulator_socket.check_neighbor_health()
-    if current_time - last_update_time >= 1000:
+    if current_time - last_hello_time >= 500:
         emulator_socket.send_hellos()
-        emulator_socket.send_linkstates()
-        return current_time
+        last_hello_time = int(time.time() * 1000)
 
-    return last_update_time
+    if current_time - last_lsp_time >= 1000:
+        emulator_socket.send_linkstates()
+        last_lsp_time = int(time.time() * 1000)
+
+    return last_hello_time, last_lsp_time
 
 
 def forwardpacket(emulator_socket, incoming_packet):
