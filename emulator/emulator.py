@@ -99,6 +99,27 @@ class EmulatorSocket:
         inner_packet = self.build_inner_packet('L', self.seq_num, data)
         return self.build_full_packet(src_ip, src_port, dest_ip, dest_port, 100, inner_packet)
 
+    def handle_trace(self, packet):
+        if packet.ttl == 0:
+            new_packet = self.build_trace_packet(100, self.listen_address[0], self.listen_address[1],
+                                        packet.dest_ip, packet.dest_port)
+            new_packet.next_hop_address = (packet.src_ip, packet.src_port)
+            self.send_packet(new_packet)
+        else:
+            new_packet = self.build_trace_packet(packet.ttl - 1, packet.src_ip, packet.src_port,
+                                                 packet.dest_ip, packet.dest_port)
+            new_packet.next_hop_address = self.forwarding_table.get_next_hop(Node(packet.dest_ip, packet.dest_port))
+            self.send_packet(new_packet)
+
+    def build_trace_packet(self, ttl, src_ip, src_port, dest_ip, dest_port):
+        src_ip = self.convert_ip_to_int(src_ip)
+        dest_ip = self.convert_ip_to_int(dest_ip)
+
+        inner_packet = self.build_inner_packet('T', 0, None)
+        full_packet = self.build_full_packet(src_ip, src_port, dest_ip, dest_port, ttl, inner_packet)
+
+        return full_packet
+
     def build_inner_packet(self, pack_type, seq_num, data):
         inner_packet = struct.pack("!cII", pack_type.encode('ascii'), socket.htonl(seq_num), 0 if data is None else len(data))
         if data is not None:
@@ -114,7 +135,6 @@ class EmulatorSocket:
     def check_neighbor_health(self):
         for node in self.topology.get_neighbors(self.root_node):
             if not self.forwarding_table.validate_node_health(node):
-                print('sending linkstate due to dead node')
                 self.send_linkstates()
 
     def refresh_neighbor_health(self, packet):
@@ -123,7 +143,6 @@ class EmulatorSocket:
             self.forwarding_table.refresh_node_heatlh(node)
         else:
             self.forwarding_table.add_node(node)
-            print('sending LSP due to new node')
             self.send_linkstates()
 
     def handle_lsp(self, packet):
@@ -137,7 +156,6 @@ class EmulatorSocket:
                 if neighbor.full_address != packet.from_address:
                     packet.next_hop_address = neighbor.full_address
                     self.send_packet(packet)
-
 
     def convert_ip_to_int(self, ip_string):
         return struct.unpack("!L", socket.inet_aton(ip_string))[0]
@@ -351,6 +369,9 @@ class ForwardingTable:
 
         return is_new
 
+    def get_next_hop(self, node):
+        return self.forwarding_table[node][0].full_address
+
     def print_forwarding_table(self):
         print("====== Current Forwarding Table ======")
         for key in sorted(self.forwarding_table.keys()):
@@ -445,6 +466,9 @@ def forwardpacket(emulator_socket, incoming_packet):
 
     if incoming_packet.type == 'L':
         emulator_socket.handle_lsp(incoming_packet)
+
+    if incoming_packet.type == 'T':
+        emulator_socket.handle_trace(incoming_packet)
 
 
 if __name__ == '__main__':
