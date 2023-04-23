@@ -7,8 +7,7 @@ import struct
 
 
 class OutgoingPacket:
-    def __init__(self, priority, type, seq_num, data, source_address, destination_address):
-        self.priority = priority
+    def __init__(self, type, seq_num, data, source_address, destination_address):
         self.type = type
         self.seq_num = seq_num
         self.length = len(data)
@@ -35,7 +34,7 @@ class OutgoingPacket:
         src_port = self.source_address[1]
         dest_port = self.destination_address[1]
 
-        return struct.pack("!BIHIHI", self.priority, int_src_ip, src_port, int_dest_ip, dest_port, 9 + self.length)
+        return struct.pack("!BIHIHII", 1, int_src_ip, src_port, int_dest_ip, dest_port, 64, 9 + self.length)
 
     def print_packet_info(self):
         pack_type = 'DATA' if self.type == 'D' else 'END'
@@ -52,16 +51,16 @@ class OutgoingPacket:
 
 class IncomingPacket:
     def __init__(self, packet):
-        outer_header = packet[:17]
-        inner_header = packet[17:26]
+        outer_header = packet[:21]
+        inner_header = packet[21:30]
 
-        self.priority, self.src_ip, self.src_port, self.dest_ip, self.dest_port, self.outer_length = struct.unpack("!BIHIHI", outer_header)
+        self.priority, self.src_ip, self.src_port, self.dest_ip, self.dest_port, self.ttl, self.outer_length = struct.unpack("!BIHIHII", outer_header)
         self.type, self.seq_num, self.length = struct.unpack("!cII", inner_header)
 
         self.type = str(self.type, 'UTF-8')
         self.seq_num = socket.ntohl(self.seq_num)
 
-        self.data = packet[26:]
+        self.data = packet[30:]
         self.data = self.data.decode() if len(self.data) > 0 else ''
 
         self.requester_address = (self.convert_int_to_ip(self.src_ip), self.src_port)
@@ -95,18 +94,26 @@ class SenderSocket:
         self.listen_address = (socket.gethostbyname(socket.gethostname()), listening_port_num)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(self.listen_address)
+        self.socket.settimeout(0)
 
         self.emulator_address = emulator_address
         self.total_retransmissions = 0
         self.total_transmissions = 0
 
     def await_file_request(self):
-        full_packet, requester_address = self.socket.recvfrom(5500)
+        self.send_hello_packet()
+        last_hello_time = int(time.time() * 1000)
+        while True:
+            last_hello_time = handle_hello(last_hello_time, self)
+            try:
+                full_packet, requester_address = self.socket.recvfrom(5500)
+                packet = IncomingPacket(full_packet)
 
-        return IncomingPacket(full_packet)
+                if packet.type == 'R':
+                    return packet
 
-    def await_ack(self):
-        full_packet, requester_address = self.socket.recvfrom(5500)
+            except Exception as e:
+                pass
 
         return IncomingPacket(full_packet)
 
@@ -119,61 +126,37 @@ class SenderSocket:
         packet.sent_time = int(time.time() * 1000)
         self.socket.sendto(packet.packet, self.emulator_address)
 
+    def send_hello_packet(self):
+        packet = OutgoingPacket('H', 0, '',
+                                sender_socket.listen_address, self.emulator_address)
+
+        self.socket.sendto(packet.packet, emulator_address)
+
     def settimeout(self, timeout):
         self.socket.settimeout(timeout)
 
 
 def get_args():
     parser = argparse.ArgumentParser(usage="sender.py -p <port> -g <requester port> -r <rate> -q <seq_no> -l <length> "
-                                           "-f <f_hostname> -e <f_port> -i <priority> -t <timeout>")
+                                           "-f <f_hostname> -e <f_port>")
 
     parser.add_argument('-p', choices=range(2050, 65536), type=int,
                         help='Port number the sender should wait for requests on', required=True)
     parser.add_argument('-g', choices=range(2050, 65536), type=int,
                         help='Port the requestor is waiting on', required=True)
     parser.add_argument('-r', type=int, help='Packets to be sent per second', required=True)
-    parser.add_argument('-q', type=int, help='Initial sequence of the packet exchange', required=True)
     parser.add_argument('-l', type=int, help='Length of packet payload in bytes', required=True)
     parser.add_argument('-f', type=str, help='Host name of the emulator', required=True)
     parser.add_argument('-e', choices=range(2050, 65536), type=int, help='the port of the emulator.', required=True)
-    parser.add_argument('-i', choices=range(1, 4), type=int, help='Priority level to send packets at.', required=True)
-    parser.add_argument('-t', type=int, help='Timeout for retransmission for lost packs in milliseconds', required=True)
     parser.add_argument('-d', type=bool, default=False, help='Debug mode', required=False)
     return parser.parse_args()
 
 
-def await_acks(sent_packets, sender_socket, timeout, packet_rate):
-    sender_socket.settimeout(0)
-
-    while len(sent_packets) > 0:
-        try:
-            incoming_packet = sender_socket.await_ack()
-
-            if incoming_packet.type == 'A' and incoming_packet.seq_num in sent_packets:
-                del sent_packets[incoming_packet.seq_num]
-        except BlockingIOError as e:
-            pass
-
-        for key in list(sent_packets.keys()):
-            outgoing_packet = sent_packets[key]
-            if int(time.time() * 1000) - outgoing_packet.sent_time > timeout:
-                if outgoing_packet.attempts >= 6:
-                    print("ERROR: Attempted sending packet with sequence number " + str(outgoing_packet.seq_num)
-                          + " six total times without acknowledgement. Packet dropped.")
-                    print("")
-                    del sent_packets[key]
-                else:
-                    outgoing_packet.attempts += 1
-                    send_time = int(time.time() * 1000)
-                    sender_socket.send_packet(outgoing_packet, 'R')
-
-                    while int(time.time() * 1000) < send_time + packet_rate:
-                        pass
-
-
 def send_file(sender_socket, request_packet, args):
     filename = request_packet.data
-    window_len = request_packet.length
+    print(filename)
+    sender_socket.send_hello_packet()
+    last_hello_time = int(time.time() * 1000)
 
     try:
         file = open(filename, 'r')
@@ -184,35 +167,38 @@ def send_file(sender_socket, request_packet, args):
     sent_packets = {}
     packet_rate = 1000 / args.r
     seq_num = 1
+    print("size", os.path.getsize(filename))
     rem_file_size = os.path.getsize(filename)
 
     while rem_file_size > 0:
-        for window in range(window_len):
-            if rem_file_size <= 0:
-                break
+        last_hello_time = handle_hello(last_hello_time, sender_socket)
+        packet = OutgoingPacket('D', seq_num, file.read(args.l),
+                                sender_socket.listen_address, request_packet.requester_address)
+        sent_packets[seq_num] = packet
 
-            packet = OutgoingPacket(args.i, 'D', seq_num, file.read(args.l),
-                                    sender_socket.listen_address, request_packet.requester_address)
-            sent_packets[seq_num] = packet
+        send_time = packet.print_packet_info()
+        sender_socket.send_packet(packet)
 
-            send_time = packet.print_packet_info()
-            sender_socket.send_packet(packet)
+        while int(time.time() * 1000) < send_time + packet_rate:
+            pass
 
-            while int(time.time() * 1000) < send_time + packet_rate:
-                pass
+        seq_num += 1
+        print(rem_file_size)
+        rem_file_size -= packet.length
 
-            seq_num += 1
-            rem_file_size -= packet.length
-
-        await_acks(sent_packets, sender_socket, args.t, packet_rate)
-
-    packet = OutgoingPacket(args.i, 'E', seq_num, '', sender_socket.listen_address, request_packet.requester_address)
+    packet = OutgoingPacket('E', seq_num, '', sender_socket.listen_address, request_packet.requester_address)
     packet.print_packet_info()
     sender_socket.send_packet(packet)
 
-    print('Packet Loss Rate: ' + str((sender_socket.total_retransmissions / sender_socket.total_transmissions) * 100)
-          + '% on ' + str(sender_socket.total_retransmissions) + ' retransmissions and '
-          + str(sender_socket.total_transmissions) + ' total transmissions')
+
+def handle_hello(last_hello_time, request_socket):
+    cur_time = int(time.time() * 1000)
+
+    if cur_time - last_hello_time >= 500:
+        last_hello_time = int(time.time() * 1000)
+        request_socket.send_hello_packet()
+
+    return last_hello_time
 
 
 if __name__ == '__main__':

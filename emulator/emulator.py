@@ -31,8 +31,29 @@ class Packet:
         self.next_hop_address = None
         self.drop_prob = 0
 
+    def set_src_ip(self, ip):
+        self.src_ip = ip
+        self.int_src_ip = self.convert_ip_to_int(ip)
+
+    def set_dest_ip(self, ip):
+        self.dest_ip = ip
+        self.int_dest_ip = self.convert_ip_to_int(ip)
+
     def convert_int_to_ip(self, int_ip):
         return socket.inet_ntoa(struct.pack('!L', int_ip))
+
+    def convert_ip_to_int(self, ip_string):
+        return struct.unpack("!L", socket.inet_aton(ip_string))[0]
+
+    def repack(self):
+        inner_packet = struct.pack("!cII", self.type.encode('ascii'),
+                                   socket.htonl(self.seq_num), 0 if self.data is None else len(self.data))
+        if self.data is not None:
+            inner_packet += self.data.encode()
+
+        outer_header = struct.pack("!BIHIHII", 1, self.int_src_ip, self.src_port, self.int_dest_ip, self.dest_port, self.ttl, len(inner_packet))
+
+        self.packet = outer_header + inner_packet
 
     def print_debug_info(self):
         print('==============INCOMING PACKET===============')
@@ -64,6 +85,7 @@ class EmulatorSocket:
         self.root_node = self.topology.get_root_node(self.listen_address)
         self.forwarding_table = ForwardingTable(self.topology, self.listen_address)
         self.seq_num = 0
+        self.unacked_packets = {}
 
     def send_hellos(self):
         for node in self.topology.get_neighbors(self.root_node):
@@ -83,14 +105,26 @@ class EmulatorSocket:
     def send_linkstates(self):
         neighbors = self.topology.get_neighbors(self.root_node)
         data = ' '.join(str(neighbor) + ',1' for neighbor in neighbors)
+        self.seq_num += 1
+
+        for key in list(self.unacked_packets.keys()):
+            packet, sent_time, retries = self.unacked_packets[key]
+            time_elapsed = int(time.time() * 1000) - sent_time
+
+            if time_elapsed >= 1000:
+                if retries == 5:
+                    del self.unacked_packets[key]
+                else:
+                    self.unacked_packets[key] = (packet, int(time.time() * 1000), retries + 1)
+                    self.send_packet(packet)
 
         for node in neighbors:
             packet = self.build_lsp(self.root_node, node, data)
             packet.next_hop_address = node.full_address
+            self.unacked_packets[(node, self.seq_num)] = (packet, int(time.time() * 1000), 0)
             self.send_packet(packet)
 
     def build_lsp(self, src_node, dest_node, data):
-        self.seq_num += 1
         src_ip = self.convert_ip_to_int(src_node.ip_address)
         src_port = src_node.port
         dest_ip = self.convert_ip_to_int(dest_node.ip_address)
@@ -101,24 +135,25 @@ class EmulatorSocket:
 
     def handle_trace(self, packet):
         if packet.ttl == 0:
-            new_packet = self.build_trace_packet(100, self.listen_address[0], self.listen_address[1],
-                                        packet.dest_ip, packet.dest_port)
-            new_packet.next_hop_address = (packet.src_ip, packet.src_port)
-            self.send_packet(new_packet)
+            packet.next_hop_address = (packet.src_ip, packet.src_port)
+            packet.ttl = 64
+            packet.set_src_ip(self.listen_address[0])
+            packet.src_port = self.listen_address[1]
+
+            self.send_packet(packet)
         else:
-            new_packet = self.build_trace_packet(packet.ttl - 1, packet.src_ip, packet.src_port,
-                                                 packet.dest_ip, packet.dest_port)
-            new_packet.next_hop_address = self.forwarding_table.get_next_hop(Node(packet.dest_ip, packet.dest_port))
-            self.send_packet(new_packet)
+            packet.ttl -= 1
+            packet.next_hop_address = self.forwarding_table.get_next_hop(Node(packet.dest_ip, packet.dest_port))
+            self.send_packet(packet)
 
-    def build_trace_packet(self, ttl, src_ip, src_port, dest_ip, dest_port):
-        src_ip = self.convert_ip_to_int(src_ip)
-        dest_ip = self.convert_ip_to_int(dest_ip)
+    def send_ack(self, packet_to_ack):
+        inner_packet = self.build_inner_packet('A', packet_to_ack.seq_num, None)
 
-        inner_packet = self.build_inner_packet('T', 0, None)
-        full_packet = self.build_full_packet(src_ip, src_port, dest_ip, dest_port, ttl, inner_packet)
+        packet = self.build_full_packet(self.convert_ip_to_int(self.listen_address[0]), self.listen_address[1],
+                                        packet_to_ack.int_src_ip, packet_to_ack.src_port, 1, inner_packet)
 
-        return full_packet
+        packet.next_hop_address = packet_to_ack.from_address
+        self.send_packet(packet)
 
     def build_inner_packet(self, pack_type, seq_num, data):
         inner_packet = struct.pack("!cII", pack_type.encode('ascii'), socket.htonl(seq_num), 0 if data is None else len(data))
@@ -146,6 +181,7 @@ class EmulatorSocket:
             self.send_linkstates()
 
     def handle_lsp(self, packet):
+        self.send_ack(packet)
         is_new = self.forwarding_table.update_lsp(packet)
 
         if is_new and packet.ttl > 0:
@@ -157,10 +193,26 @@ class EmulatorSocket:
                     packet.next_hop_address = neighbor.full_address
                     self.send_packet(packet)
 
+    def handle_ack(self, packet):
+        node = Node(packet.src_ip, packet.src_port)
+        key = (node, packet.seq_num)
+
+        if key in self.unacked_packets:
+            del self.unacked_packets[key]
+
     def convert_ip_to_int(self, ip_string):
         return struct.unpack("!L", socket.inet_aton(ip_string))[0]
 
+    def forward_packet(self, packet):
+        if packet.ttl > 0:
+            print('forwarding packet')
+            packet.ttl -= 1
+            packet.next_hop_address = self.forwarding_table.get_next_hop(Node(packet.dest_ip, packet.dest_port))
+            print(packet.src_port)
+            self.send_packet(packet)
+
     def send_packet(self, packet):
+        packet.repack()
         self.socket.sendto(packet.packet, packet.next_hop_address)
 
     def await_packet(self):
@@ -239,12 +291,18 @@ class NetworkTopology:
     def update_node(self, packet, node, neighbors):
         if node not in self.node_table:
             self.node_table[node] = (neighbors, packet)
+            for neighbor in neighbors:
+                if neighbor not in self.node_table:
+                    self.node_table[neighbor] = ([node], packet)
             return True, True
 
         if self.node_table[node][1] is None or self.node_table[node][1].seq_num < packet.seq_num:
 
             if set(self.node_table[node][0]) != set(neighbors):
                 self.node_table[node] = (neighbors, packet)
+                for neighbor in neighbors:
+                    if neighbor not in self.node_table:
+                        self.node_table[neighbor] = ([node], packet)
                 return True, True
             else:
                 self.node_table[node] = (self.node_table[node][0], packet)
@@ -292,6 +350,7 @@ class ForwardingTable:
     def buildForwardTable(self):
         self.forwarding_table = {}
         self.topology.remove_unreachable()
+
         all_nodes = self.topology.get_all_nodes()
         visited_nodes = []
 
@@ -303,7 +362,7 @@ class ForwardingTable:
         cost_queue.put((0, root_node))
 
         cur_cost = 0
-        while set(visited_nodes) != set(all_nodes) and not cost_queue.empty() and cur_cost < len(all_nodes):
+        while set(visited_nodes) != set(all_nodes) and not cost_queue.empty() and cur_cost <= len(all_nodes):
             cur_cost, cur_node = cost_queue.get()
             visited_nodes.append(cur_node)
 
@@ -463,12 +522,21 @@ def forwardpacket(emulator_socket, incoming_packet):
 
     if incoming_packet.type == 'H':
         emulator_socket.refresh_neighbor_health(incoming_packet)
+        return
 
     if incoming_packet.type == 'L':
         emulator_socket.handle_lsp(incoming_packet)
+        return
 
     if incoming_packet.type == 'T':
         emulator_socket.handle_trace(incoming_packet)
+        return
+
+    if incoming_packet.type == 'A':
+        emulator_socket.handle_ack(incoming_packet)
+        return
+
+    emulator_socket.forward_packet(incoming_packet)
 
 
 if __name__ == '__main__':
