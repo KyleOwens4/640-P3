@@ -340,6 +340,46 @@ class NetworkTopology:
         print()
 
 
+class TableQueue:
+    def __init__(self):
+        self.queue = []
+
+    def push(self, cost, item, next_hop):
+        found = False
+        for i in range(len(self.queue)):
+            if self.queue[i][1] == item:
+                found = True
+                if self.queue[i][0] >= cost:
+                    self.queue[i] = (cost, item, next_hop)
+
+        if not found:
+            self.queue.append(tuple([cost, item, next_hop]))
+
+    def next(self):
+        min = 99999999
+        min_index = -1
+        for i in range(len(self.queue)):
+            if self.queue[i][0] < min:
+                min = self.queue[i][0]
+                min_index = i
+
+        return self.queue.pop(min_index)
+
+    def contains(self, item):
+        for i in range(len(self.queue)):
+            if self.queue[i][1] == item:
+                return True
+
+        return False
+
+    def entries(self):
+        return self.queue
+
+    def empty(self):
+        return True if len(self.queue) == 0 else False
+
+
+
 class ForwardingTable:
     def __init__(self, topology, root_address):
         self.forwarding_table = {}
@@ -351,29 +391,23 @@ class ForwardingTable:
         self.forwarding_table = {}
         self.topology.remove_unreachable()
 
-        all_nodes = self.topology.get_all_nodes()
-        visited_nodes = []
-
         root_node = self.topology.get_root_node(self.root_address)
-        root_neighbors = self.topology.get_neighbors(root_node)
-        next_hop_node = None
 
-        cost_queue = PriorityQueue()
-        cost_queue.put((0, root_node))
+        confirmed_nodes = TableQueue()
+        tentative_queue = TableQueue()
+        tentative_queue.push(0, root_node, None)
 
-        cur_cost = 0
-        while set(visited_nodes) != set(all_nodes) and not cost_queue.empty() and cur_cost <= len(all_nodes):
-            cur_cost, cur_node = cost_queue.get()
-            visited_nodes.append(cur_node)
-
-            # keep track of the root neighbor we last went through so we can use it as the next hop
-            if cur_node in root_neighbors:
-                next_hop_node = cur_node
+        while not tentative_queue.empty():
+            cur_cost, cur_node, next_hop_node = tentative_queue.next()
+            confirmed_nodes.push(cur_cost, cur_node, next_hop_node)
 
             for node in self.topology.get_neighbors(cur_node):
-                cost_queue.put((cur_cost + 1, node))
+                if not confirmed_nodes.contains(node):
+                    tentative_queue.push(cur_cost + 1, node, node if next_hop_node is None else next_hop_node)
 
-                self.update_forwarding_table(node, cur_cost + 1, root_node, next_hop_node)
+        for entry in confirmed_nodes.entries():
+            if entry[2] is not None:
+                self.forwarding_table[entry[1]] = [entry[2], entry[0], int(time.time() * 1000)]
 
         self.topology.print_network_topology()
         self.print_forwarding_table()
